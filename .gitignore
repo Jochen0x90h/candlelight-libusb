@@ -1,0 +1,12 @@
+build*/
+cmake-build*/
+
+# CLion
+.idea/
+
+# QtCreator
+CMakeLists.txt.user
+
+# KiCad
+*.gbr
+*.drl
