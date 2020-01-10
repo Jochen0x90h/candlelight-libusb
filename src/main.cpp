@@ -4,11 +4,15 @@
 #include <libusb.h>
 #include <iostream>
 
-// stm32f103xx data sheet: https://www.st.com/resource/en/datasheet/stm32f042c6.pdf
-// stm32f103xx reference manual: https://www.st.com/content/ccc/resource/technical/document/reference_manual/c2/f8/8a/f2/18/e6/43/96/DM00031936.pdf/files/DM00031936.pdf/jcr:content/translations/en.DM00031936.pdf
+// stm32f042xx data sheet: https://www.st.com/resource/en/datasheet/stm32f042c6.pdf
+// stm32f042xx reference manual: https://www.st.com/content/ccc/resource/technical/document/reference_manual/c2/f8/8a/f2/18/e6/43/96/DM00031936.pdf/files/DM00031936.pdf/jcr:content/translations/en.DM00031936.pdf
 //   can bit timing: section 29.7.7, page 829
 
+// OBD-II PIDs: https://en.wikipedia.org/wiki/OBD-II_PIDs
 
+// gs_usb linux can driver: https://github.com/torvalds/linux/blob/master/drivers/net/can/usb/gs_usb.c
+
+/*
 // https://github.com/libusb/libusb/blob/master/examples/listdevs.c
 static void printDevices(libusb_device **devs)
 {
@@ -135,6 +139,7 @@ static int printDevice(libusb_device *dev, int level)
 
 	return 0;
 }
+*/
 
 /*
  * USB directions
@@ -194,6 +199,31 @@ enum gs_usb_breq {
 	GS_USB_BREQ_IDENTIFY,
 };
 
+// host config
+static const uint32_t GS_CAN_CONFIG_BYTE_ORDER = 0x0000beef;
+struct gs_host_config {
+	uint32_t byte_order;
+};
+
+// device config
+struct gs_device_config {
+	uint8_t reserved1;
+	uint8_t reserved2;
+	uint8_t reserved3;
+	uint8_t icount;
+	uint32_t sw_version;
+	uint32_t hw_version;
+};
+
+// identify mode (identify lets the leds of the can adapter blink)
+enum gs_can_identify_mode {
+	GS_CAN_IDENTIFY_OFF = 0,
+	GS_CAN_IDENTIFY_ON
+};
+struct gs_identify_mode {
+	uint32_t mode;
+};
+
 // bit timing constraints
 struct gs_device_bt_const {
 	uint32_t feature;
@@ -224,20 +254,16 @@ enum gs_can_mode {
 	// starts a channel
 	GS_CAN_MODE_START
 };
-
-// can mode flags
-static const int GS_CAN_MODE_NORMAL = 0;
-static const int GS_CAN_MODE_LISTEN_ONLY = (1<<0);
-static const int GS_CAN_MODE_LOOP_BACK = (1<<1);
-static const int GS_CAN_MODE_TRIPLE_SAMPLE = (1<<2);
-static const int GS_CAN_MODE_ONE_SHOT = (1<<3);
-static const int GS_CAN_MODE_HW_TIMESTAMP = (1<<4);
-static const int GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE = (1<<7);
-
-// can mode and flags
+static const int GS_CAN_MODE_NORMAL_FLAG = 0;
+static const int GS_CAN_MODE_LISTEN_ONLY_FLAG = (1<<0);
+static const int GS_CAN_MODE_LOOP_BACK_FLAG = (1<<1);
+static const int GS_CAN_MODE_TRIPLE_SAMPLE_FLAG = (1<<2);
+static const int GS_CAN_MODE_ONE_SHOT_FLAG = (1<<3);
+static const int GS_CAN_MODE_HW_TIMESTAMP_FLAG = (1<<4);
+static const int GS_CAN_MODE_PAD_PKTS_TO_MAX_PKT_SIZE_FLAG = (1<<7);
 struct gs_device_mode {
-	uint32_t mode;
-	uint32_t flags;
+	uint32_t mode; // enum gs_can_mode
+	uint32_t flags; // combination of GS_CAN_MODE_..._FLAG
 };
 
 // host frame
@@ -258,6 +284,103 @@ struct gs_host_frame {
 	uint32_t timestamp_us;
 };
 
+
+template <typename T>
+int controlIn(libusb_device_handle *handle, uint8_t request, T &data) {
+	return libusb_control_transfer(handle,
+		USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
+		request,
+		0,
+		0,
+		reinterpret_cast<unsigned char*>(&data),
+		sizeof(data),
+		1000);
+}
+
+template <typename T>
+int controlOut(libusb_device_handle *handle, uint8_t request, const T &data) {
+	return libusb_control_transfer(handle,
+		USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
+		request,
+		0,
+		0,
+		reinterpret_cast<unsigned char*>(const_cast<T*>(&data)),
+		sizeof(data),
+		1000);
+}
+
+template <typename T>
+int dataIn(libusb_device_handle *handle, T &data) {
+	int transferred;
+	int ret = libusb_bulk_transfer(handle,
+		0x81,
+		reinterpret_cast<unsigned char*>(&data),
+		sizeof(data),
+		&transferred,
+		1000);
+	return ret >= 0 ? transferred : ret;
+}
+
+template <typename T>
+int dataOut(libusb_device_handle *handle, const T &data) {
+	int transferred;
+	int ret = libusb_bulk_transfer(handle,
+		0x02,
+		reinterpret_cast<unsigned char*>(const_cast<T*>(&data)),
+		sizeof(data),
+		&transferred,
+		1000);
+	return ret >= 0 ? transferred : ret;
+}
+
+void getSupported(libusb_device_handle *handle) {
+	int ret;
+	gs_host_frame frame = {};
+	
+	std::cout << "supported pids" << std::endl;
+	int base = 0;
+	int failCount = 0;
+	while (base < 96) {
+		// send frame
+		frame.can_id = 0x7DF;
+		frame.can_dlc = 8;
+		frame.data[0] = 2; // number of bytes
+		frame.data[1] = 1; // service: show current data
+		frame.data[2] = base; // supported 32 pids starting at base
+		frame.data[3] = 0x55;
+		frame.data[4] = 0x55;
+		frame.data[5] = 0x55;
+		frame.data[6] = 0x55;
+		frame.data[7] = 0x55;
+
+		ret = dataOut(handle, frame);
+		
+		// receive echo
+		frame = {};
+		ret = dataIn(handle, frame);
+
+		// receive result
+		frame = {};
+		ret = dataIn(handle, frame);
+		if (ret < 0) {
+			if (failCount < 3) {
+				++failCount;
+				continue;
+			} else {
+				return;
+			}
+		}
+		for (int i = 0; i < 32; ++i) {
+			
+			if (frame.data[3 + i / 8] & (0x80 >> (i & 7))) {
+				std::cout << (base + i) << std::endl;
+			}
+		}
+		base += 32;
+	}
+}
+
+
 /**
  * List usb devices
  * Linux: lsusb
@@ -277,7 +400,7 @@ int main(void) {
 		libusb_exit(NULL);
 		return (int) cnt;
 	}
-
+/*
 	// print list of devices
 	printDevices(devs);
 
@@ -285,7 +408,7 @@ int main(void) {
 	for (int i = 0; devs[i]; ++i) {
 		printDevice(devs[i], 0);
 	}
-
+*/
 
 	for (int i = 0; devs[i]; ++i) {
 		libusb_device *dev = devs[i];
@@ -296,6 +419,8 @@ int main(void) {
 			std::cerr << "failed to get device descriptor" << std::endl;
 			return -1;
 		}
+		
+		// check if linux gs_usb device (vendor is OpenMoko)
 		if (desc.idVendor == 0x1d50 && desc.idProduct == 0x606f) {
 			libusb_device_handle *handle;
 			ret = libusb_open(dev, &handle);
@@ -305,17 +430,18 @@ int main(void) {
 				ret = libusb_get_config_descriptor(dev, 0, &config);
 
 				// set first configuration (reset alt_setting, reset toggles)
-				libusb_set_configuration(handle, config->bConfigurationValue);
+				ret = libusb_set_configuration(handle, config->bConfigurationValue);
+				std::cout << "set configuration: " << ret << std::endl;
 
 				// claim interface with bInterfaceNumber = 0
 				ret = libusb_claim_interface(handle, 0);
-				std::cout << "claim interface " << ret << std::endl;
+				std::cout << "claim interface: " << ret << std::endl;
 
 				ret = libusb_set_interface_alt_setting(handle, 0, 0);
-				std::cout << "set alternate setting " << ret << std::endl;
+				std::cout << "set alternate setting: " << ret << std::endl;
 
 /*
-				// test: get device descriptor
+				// test: get device descriptor using control transfer instead of libusb_get_device_descriptor
 				// https://www.beyondlogic.org/usbnutshell/usb5.shtml
 				UsbDeviceDescriptor descriptor;
 				ret = libusb_control_transfer(handle,
@@ -328,31 +454,45 @@ int main(void) {
 					1000);
 				std::cout << "get device descriptor " << ret << std::endl;
 */
-				// disable
+				// set host config
+				gs_host_config hostConfig;
+				hostConfig.byte_order = GS_CAN_CONFIG_BYTE_ORDER;
+				ret = controlOut(handle, GS_USB_BREQ_HOST_FORMAT, hostConfig);
+				std::cout << "set host config: " << ret << std::endl;
+
+				// get deive config
+				gs_device_config deviceConfig;
+				ret = controlIn(handle, GS_USB_BREQ_DEVICE_CONFIG, deviceConfig);
+				std::cout << "get device config: " << ret << std::endl;
+				std::cout << "hw version: " << deviceConfig.hw_version << std::endl;
+				std::cout << "sw version: " << deviceConfig.sw_version << std::endl;
+
+				// disable can
 				gs_device_mode mode;
 				mode.mode = GS_CAN_MODE_RESET;
 				mode.flags = 0;
-				ret = libusb_control_transfer(handle,
-					USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-					GS_USB_BREQ_MODE,
-					0,
-					0,
-					reinterpret_cast<unsigned char*>(&mode),
-					sizeof(mode),
-					1000);
-				std::cout << "reset can " << ret << std::endl;
+				ret = controlOut(handle, GS_USB_BREQ_MODE, mode);
+				std::cout << "reset can: " << ret << std::endl;
+
+				// identify on (let leds blink)
+				gs_identify_mode identifyMode;
+				identifyMode.mode = GS_CAN_IDENTIFY_ON;
+				ret = controlOut(handle, GS_USB_BREQ_IDENTIFY, identifyMode);
+				std::cout << "identify on: " << ret << std::endl;
+				
+				// wait for 3s
+				usleep(3000000);
+
+				// identify off
+				identifyMode.mode = GS_CAN_IDENTIFY_OFF;
+				ret = controlOut(handle, GS_USB_BREQ_IDENTIFY, identifyMode);
+				std::cout << "identify off: " << ret << std::endl;
 
 				// get bit timing constriants
 				gs_device_bt_const bitTimingConstraints;
-				ret = libusb_control_transfer(handle,
-					USB_DIR_IN | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-					GS_USB_BREQ_BT_CONST,
-					0,
-					0,
-					reinterpret_cast<unsigned char*>(&bitTimingConstraints),
-					sizeof(bitTimingConstraints),
-					1000);
-				std::cout << "get bit timing constraints " << ret << std::endl;
+				ret = controlIn(handle, GS_USB_BREQ_BT_CONST, bitTimingConstraints);
+				std::cout << "get bit timing constraints: " << ret << std::endl;
+				std::cout << "clock rate: " << bitTimingConstraints.fclk_can << std::endl;
 
 				/*
 					set bit timing
@@ -367,71 +507,82 @@ int main(void) {
 				bitTiming.phase_seg2 = 2; // [1, 8]
 				bitTiming.sjw = 1; // [1, 4]
 				bitTiming.brp = bitTimingConstraints.fclk_can / (500000 * 16); // [1, 1024]
-				ret = libusb_control_transfer(handle,
-					USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-					GS_USB_BREQ_BITTIMING,
-					0,
-					0,
-					reinterpret_cast<unsigned char*>(&bitTiming),
-					sizeof(bitTiming),
-					1000);
-				std::cout << "set bit timing " << ret << std::endl;
+				ret = controlOut(handle, GS_USB_BREQ_BITTIMING, bitTiming);
+				std::cout << "set bit timing: " << ret << std::endl;
 
-				// enable
+				// enable can
 				mode.mode = GS_CAN_MODE_START;
-				mode.flags = 0;
-				ret = libusb_control_transfer(handle,
-					USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-					GS_USB_BREQ_MODE,
-					0,
-					0,
-					reinterpret_cast<unsigned char*>(&mode),
-					sizeof(mode),
-					1000);
-				std::cout << "enable can " << ret << std::endl;
+				mode.flags = GS_CAN_MODE_HW_TIMESTAMP_FLAG;
+				mode.flags |= GS_CAN_MODE_LOOP_BACK_FLAG; // loopback mode
+				ret = controlOut(handle, GS_USB_BREQ_MODE, mode);
+				std::cout << "enable can: " << ret << std::endl;
+
+				// empty queue
+				gs_host_frame frame = {};
+				do {
+					ret = dataIn(handle, frame);
+					std::cout << "purge: " << ret << std::endl;
+				} while (ret == 0);
+
+				getSupported(handle);
 
 				while (true) {
 					// send frame
-					// https://en.wikipedia.org/wiki/OBD-II_PIDs
-					gs_host_frame frame = {};
+					frame = {};
 					frame.can_id = 0x7DF;
 					frame.can_dlc = 8;
 					frame.data[0] = 2; // number of bytes
-					frame.data[1] = 1; // show current data
+					frame.data[1] = 1; // service: show current data
 					//frame.data[2] = 12; // engine rpm
 					frame.data[2] = 13; // km/h
+					//frame.data[2] = 17; // throttle position
+					//frame.data[2] = 34; // fuel rail pressure: does not work
+					//frame.data[2] = 47; // fuel tank level: does not work
 					frame.data[3] = 0x55;
 					frame.data[4] = 0x55;
 					frame.data[5] = 0x55;
 					frame.data[6] = 0x55;
 					frame.data[7] = 0x55;
+					ret = dataOut(handle, frame);
+					std::cout << "sent: " << ret << std::endl;
 					
-					int transferred = 0;
-					ret = libusb_bulk_transfer(handle,
-						0x02,
-						reinterpret_cast<unsigned char*>(&frame),
-						sizeof(frame),
-						&transferred,
-						1000);
-					std::cout << ret << " sent " << transferred << std::endl << std::endl;
+					// receive echo
+					frame = {};
+					ret = dataIn(handle, frame);
+					std::cout << "echo: " << ret << " timestamp: " << frame.timestamp_us << std::endl;
+
+					// receive result
+					frame = {};
+					ret = dataIn(handle, frame);
+					std::cout << "received: " << ret << " timestamp: " << frame.timestamp_us << std::endl;
+					std::cout << "can id: 0x" << std::hex << frame.can_id << std::dec << std::endl; // expect 0x7e8 - 0x7EF
+					std::cout << "number of bytes: " << int(frame.data[0]) << std::endl;
+					std::cout << "service: " << std::hex << int(frame.data[1]) << std::dec << std::endl; // expect 0x41
+					switch (frame.data[2]) {
+					case 12:
+						std::cout << "rpm: " << ((frame.data[3] << 8) + frame.data[4]) / 4.0f << std::endl;
+						break;
+					case 13:
+						std::cout << "km/h: " << int(frame.data[3]) << std::endl;
+						break;
+					case 17:
+						std::cout << "throttle position: " << int(frame.data[3]) << std::endl;
+						break;
+					case 47:
+						std::cout << "fuel tank level: " << int(frame.data[3]) << std::endl;
+						break;
+					default:
+						std::cout << "unknown pid" << std::endl;
+					}
+
+					std::cout << std::endl;
 					
-					ret = libusb_bulk_transfer(handle,
-						0x81,
-						reinterpret_cast<unsigned char*>(&frame),
-						sizeof(frame),
-						&transferred,
-						1000);
-					std::cout << ret << " received " << transferred << std::endl;
-					std::cout << "number of bytes " << int(frame.data[0]) << std::endl;
-					std::cout << "service " << std::hex << int(frame.data[1]) << std::dec << std::endl;
-					std::cout << "km/h " << int(frame.data[2]) << std::endl;
-					
+					// wait for 1s
 					usleep(1000000);
 				}
 			}
 		}
 	}
-
 
 	libusb_free_device_list(devs, 1);
 
